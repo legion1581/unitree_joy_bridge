@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import signal
 import struct
+import subprocess
 import sys
 import time
 from typing import Optional
@@ -66,6 +68,21 @@ def build_uinput() -> UInput:
     )
 
 
+def resolve_js_path(event_path: str, retries: int = 10, delay: float = 0.05) -> Optional[str]:
+    """Given /dev/input/eventN, find the sibling /dev/input/jsM created by joydev."""
+    event_name = os.path.basename(event_path)  # "eventN"
+    sys_event = f"/sys/class/input/{event_name}/device"
+    for _ in range(retries):
+        try:
+            for entry in os.listdir(sys_event):
+                if entry.startswith("js") and entry[2:].isdigit():
+                    return f"/dev/input/{entry}"
+        except FileNotFoundError:
+            pass
+        time.sleep(delay)
+    return None
+
+
 def axis_to_int(v: float) -> int:
     v = max(-1.0, min(1.0, v))
     return int(round(v * AXIS_MAX))
@@ -75,6 +92,7 @@ class Bridge:
     def __init__(self, ui: UInput, verbose: bool = False):
         self.ui = ui
         self.verbose = verbose
+        self.verbose_ready = False
         self.prev_buttons: dict[str, bool] = {name: False for name in BUTTON_NAMES}
         self.prev_axes = {"lx": 0, "ly": 0, "rx": 0, "ry": 0}
         self.prev_hat = (0, 0)
@@ -132,7 +150,7 @@ class Bridge:
         if changed:
             self.ui.syn()
 
-        if self.verbose:
+        if self.verbose and self.verbose_ready:
             pressed = [n for n, v in buttons.items() if v]
             sys.stdout.write(
                 f"\rlx={lx:+.2f} ly={ly:+.2f} rx={rx:+.2f} ry={ry:+.2f} "
@@ -142,14 +160,14 @@ class Bridge:
             sys.stdout.flush()
 
 
-async def scan_for_remote(timeout: float = 8.0) -> Optional[str]:
+async def scan_for_remote(timeout: float = 8.0, hci: str = "hci0") -> Optional[str]:
     try:
         from bleak import BleakScanner
     except ImportError:
         print("bleak not installed; cannot scan. Pass --address or pip install bleak.", file=sys.stderr)
         return None
-    print(f"Scanning for Unitree remote ({timeout:.0f}s)...", file=sys.stderr)
-    devices = await BleakScanner.discover(timeout=timeout)
+    print(f"Scanning for Unitree remote on {hci} ({timeout:.0f}s)...", file=sys.stderr)
+    devices = await BleakScanner.discover(timeout=timeout, adapter=hci)
     for d in devices:
         name = (d.name or "")
         if name.startswith("Unitree"):
@@ -158,18 +176,60 @@ async def scan_for_remote(timeout: float = 8.0) -> Optional[str]:
     return None
 
 
-def connect_remote(address: str, hci: str, bridge: Bridge) -> tuple[pygatt.BLEDevice, pygatt.GATTToolBackend]:
-    adapter = pygatt.GATTToolBackend(hci_device=hci)
-    adapter.start()
+async def warmup_adapter(hci: str, timeout: float = 3.0) -> None:
+    """
+    Brief bleak scan to populate BlueZ's LE device cache on the adapter.
+    gatttool's first LE-Create-Connection otherwise waits for BlueZ to
+    organically see an advertisement, which often exceeds its own timeout.
+    """
     try:
-        device = adapter.connect(
-            address,
-            address_type=pygatt.BLEAddressType.public,
-            timeout=15,
-        )
+        from bleak import BleakScanner
+    except ImportError:
+        return
+    try:
+        await BleakScanner.discover(timeout=timeout, adapter=hci)
     except Exception:
-        adapter.stop()
-        raise
+        pass
+
+
+def connect_remote(address: str, hci: str, bridge: Bridge, attempts: int = 3):
+    last_err: Optional[Exception] = None
+    adapter = None
+    device = None
+
+    for attempt in range(1, attempts + 1):
+        # Clear stale BlueZ cache (bleak scan / prior pairing can block gatttool)
+        try:
+            subprocess.run(
+                ["bluetoothctl", "remove", address],
+                capture_output=True, timeout=3, check=False,
+            )
+        except Exception:
+            pass
+
+        adapter = pygatt.GATTToolBackend(hci_device=hci)
+        adapter.start()
+        try:
+            device = adapter.connect(
+                address,
+                address_type=pygatt.BLEAddressType.public,
+                timeout=15,
+            )
+            last_err = None
+            break
+        except Exception as ex:
+            last_err = ex
+            print(f"Attempt {attempt}/{attempts} failed: {ex}", file=sys.stderr)
+            try:
+                adapter.stop()
+            except Exception:
+                pass
+            adapter = None
+            device = None
+            time.sleep(1.0)
+
+    if last_err is not None or device is None:
+        raise RuntimeError(f"Connect failed after {attempts} attempts: {last_err}")
 
     try:
         device.char_write(WRITE_UUID, HANDSHAKE, wait_for_response=False)
@@ -186,17 +246,22 @@ def connect_remote(address: str, hci: str, bridge: Bridge) -> tuple[pygatt.BLEDe
 def main() -> int:
     parser = argparse.ArgumentParser(description="Unitree BLE remote -> uinput gamepad bridge")
     parser.add_argument("--address", "-a", help="Remote MAC address (if omitted, scans for 'Unitree*')")
-    parser.add_argument("--hci", default="hci0", help="HCI device (default: hci0)")
+    parser.add_argument("--hci", "-i", default="hci0",
+                        help="HCI adapter for both scan and connect (e.g. hci0, hci1). Default: hci0")
     parser.add_argument("--verbose", "-v", action="store_true", help="Print decoded state to stdout")
     parser.add_argument("--scan-timeout", type=float, default=8.0)
     args = parser.parse_args()
 
     address = args.address
     if not address:
-        address = asyncio.run(scan_for_remote(args.scan_timeout))
+        address = asyncio.run(scan_for_remote(args.scan_timeout, args.hci))
         if not address:
             print("No Unitree remote found. Power it on and try again, or pass --address.", file=sys.stderr)
             return 2
+    else:
+        # Warm up BlueZ so gatttool's first connect attempt doesn't time out.
+        print(f"Warming up {args.hci} (brief LE scan)...", file=sys.stderr)
+        asyncio.run(warmup_adapter(args.hci))
 
     try:
         ui = build_uinput()
@@ -221,7 +286,11 @@ def main() -> int:
     try:
         print(f"Connecting to {address} on {args.hci}...", file=sys.stderr)
         device, adapter = connect_remote(address, args.hci, bridge)
-        print(f"Connected. Virtual gamepad up as '{ui.device.name}' (/dev/input/{ui.device.path.split('/')[-1]})", file=sys.stderr)
+        event_path = ui.device.path
+        js_path = resolve_js_path(event_path)
+        paths = f"{event_path}" + (f" + {js_path}" if js_path else " (no jsX yet)")
+        print(f"Connected. Virtual gamepad '{ui.device.name}' → {paths}", file=sys.stderr, flush=True)
+        bridge.verbose_ready = True
 
         while not stop["flag"]:
             if (time.monotonic() - bridge.last_notify) > STALE_TIMEOUT:
