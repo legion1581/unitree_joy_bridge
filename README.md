@@ -1,4 +1,6 @@
-# unitree_handheld_joy_bridge
+# Unitree Joy Bridge
+
+Turn a Unitree BLE handheld remote into a standard Linux gamepad.
 
 <p align="center">
   <img src="images/header.webp" alt="Unitree R3 handheld remote" width="520">
