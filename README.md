@@ -13,8 +13,7 @@ consumer sees it as a normal controller — no Unitree-specific integration need
 ## Supported hardware
 
 - Unitree R3 handheld remote
-- Older Unitree BLE handhelds using the same **FFE0/FFE1/FFE2** GATT service
-  (same protocol family, 20-byte packets, `"YS+2"` handshake)
+- Older Unitree handheld remote (not sure about the model name)
 
 The script discovers any BLE device whose advertised name starts with `Unitree`.
 
